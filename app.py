@@ -4,41 +4,41 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 import jwt
 import datetime
-import firebase_admin
-from firebase_admin import auth, credentials
+import random
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
+import string
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'your-secret-key-here'
-socketio = SocketIO(app, cors_allowed_origins="*", ping_interval=10, ping_timeout=5)
+app.config['SECRET_KEY'] = 'K9p#mN$jL2vQ8rT5xW1zY4bU7tR3eF6hJ0'  # Consistent secret key
+socketio = SocketIO(app, cors_allowed_origins="*")
 
-# Initialize Firebase Admin SDK
-cred = credentials.Certificate('firebase-adminsdk.json')  # Path to your JSON file
-firebase_admin.initialize_app(cred)
-
-# PostgreSQL connection
+# Database connection
 def get_db_connection():
     return psycopg2.connect(
         dbname="pchat",
         user="postgres",
-        password="Naveen13419",
-        host="34.172.7.213",
+        password="Muppalla13419",
+        host="35.192.19.194",
         port=5432,
         cursor_factory=RealDictCursor
     )
 
+# Rate limiting
 limiter = Limiter(app=app, key_func=get_remote_address)
 otp_limiter = limiter.limit("5 per 15 minutes")
+
+# Store online users
 online_users = {}
 
+# Authentication decorator
 def authenticate_token(f):
     def wrapper(*args, **kwargs):
         token = request.headers.get('Authorization', '').split(' ')[1] if 'Authorization' in request.headers else None
         if not token:
             return jsonify({"success": False, "message": "Unauthorized"}), 401
         try:
-            decoded = jwt.decode(token, 'your-secret-key-here', algorithms=["HS256"])
+            decoded = jwt.decode(token, app.config['SECRET_KEY'], algorithms=["HS256"])
             request.user_id = decoded['id']
             return f(*args, **kwargs)
         except jwt.InvalidTokenError as e:
@@ -46,114 +46,141 @@ def authenticate_token(f):
     wrapper.__name__ = f.__name__
     return wrapper
 
-@app.route('/api/send-otp', methods=['POST'])
-@otp_limiter
-def send_otp():
-    phone_number = request.json.get('phone_number')
-    try:
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute('SELECT "id" FROM "users" WHERE "phone_number" = %s', (phone_number,))
-                user_check = cur.fetchone()
-                if user_check:
-                    user_id = user_check['id']
-                else:
-                    cur.execute(
-                        'INSERT INTO "users" ("phone_number", "username") VALUES (%s, %s) RETURNING "id"',
-                        (phone_number, phone_number)
-                    )
-                    user_id = cur.fetchone()['id']
-                
-                # Generate a custom token for Firebase (client will use this to trigger OTP)
-                custom_token = auth.create_custom_token(str(user_id)).decode('utf-8')
-                print(f"Generated custom token for {phone_number}: {custom_token}")
-                
-                # Store phone number and user_id for verification (temporary storage)
-                cur.execute(
-                    'INSERT INTO "otps" ("user_id", "otp") VALUES (%s, %s) ON CONFLICT ("user_id", "otp") DO UPDATE SET "otp" = %s',
-                    (user_id, "pending", "pending")  # Placeholder until client verifies
-                )
-                conn.commit()
+def generate_otp():
+    return ''.join(random.choices(string.digits, k=6))
 
-        # Return custom token to client to initiate Firebase OTP
-        return jsonify({"success": True, "user_id": user_id, "custom_token": custom_token}), 200
+@app.route('/api/send-otp', methods=['POST'])
+@limiter.limit("5 per minute")
+def send_otp():
+    conn = None
+    cur = None
+    try:
+        data = request.get_json()
+        phone_number = data.get('phone_number')
+        if not phone_number:
+            return jsonify({'error': 'Phone number required'}), 400
+        otp = generate_otp()
+        conn = get_db_connection()
+        cur = conn.cursor()
+        # Check if phone number already exists
+        cur.execute('SELECT "id" FROM "users" WHERE "phone_number" = %s', (phone_number,))
+        user = cur.fetchone()
+        if user:
+            user_id = user['id']  # Use dict key since RealDictCursor is used
+        else:
+            # Insert new user with null username
+            cur.execute(
+                'INSERT INTO "users" ("phone_number") VALUES (%s) RETURNING "id"',
+                (phone_number,)
+            )
+            user_id = cur.fetchone()['id']
+        # Store OTP
+        cur.execute(
+            'INSERT INTO "otps" ("user_id", "otp", "created_at") '
+            'VALUES (%s, %s, CURRENT_TIMESTAMP) ON CONFLICT ("user_id", "otp") DO NOTHING',
+            (user_id, otp)
+        )
+        # Simulate sending OTP (replace with real SMS service)
+        print(f"OTP for {phone_number}: {otp}")
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({'user_id': user_id})
+    except psycopg2.Error as e:
+        if cur is not None:
+            cur.close()
+        if conn is not None:
+            conn.rollback()
+            conn.close()
+        print(f"Database error: {e.pgcode} - {e.pgerror}")
+        return jsonify({'error': f"Database error: {e.pgerror}"}), 500
     except Exception as e:
-        print(f"Error sending OTP: {e}")
-        return jsonify({"success": False, "message": "Failed to send OTP", "error": str(e)}), 500
+        if cur is not None:
+            cur.close()
+        if conn is not None:
+            conn.rollback()
+            conn.close()
+        print(f"Send OTP error: {type(e).__name__} - {str(e)}")
+        return jsonify({'error': f"{type(e).__name__}: {str(e)}"}), 500
 
 @app.route('/api/verify-otp', methods=['POST'])
 def verify_otp():
     user_id = request.json.get('user_id')
-    firebase_token = request.json.get('firebase_token')  # Token from client after OTP verification
+    otp = request.json.get('otp')
     try:
-        # Verify Firebase token
-        decoded_token = auth.verify_id_token(firebase_token)
-        if str(decoded_token['uid']) != str(user_id):
-            return jsonify({"success": False, "message": "Invalid token"}), 401
-
         with get_db_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute('SELECT "otp" FROM "otps" WHERE "user_id" = %s', (user_id,))
                 result = cur.fetchone()
-                if result and result['otp'] == "pending":
+                if result and result['otp'] == otp:
                     cur.execute('DELETE FROM "otps" WHERE "user_id" = %s', (user_id,))
                     conn.commit()
                     return jsonify({"success": True}), 200
                 else:
-                    return jsonify({"success": False, "message": "OTP not pending or invalid"}), 401
+                    return jsonify({"success": False, "message": "Invalid OTP"}), 400
     except Exception as e:
-        print(f"OTP verification error: {e}")
-        return jsonify({"success": False, "message": "Verification failed", "error": str(e)}), 500
+        print(f"Verify OTP error: {e}")
+        return jsonify({"success": False, "message": "OTP verification failed", "error": str(e)}), 500
 
-# Rest of your routes (unchanged unless specified)
 @app.route('/api/register', methods=['POST'])
 def register():
-    user_id = request.json.get('user_id')
-    username = request.json.get('username')
-    public_key = request.json.get('public_key')
+    data = request.get_json()
+    user_id = data.get('user_id')
+    username = data.get('username')
+    public_key = data.get('public_key')
+    if not all([user_id, username, public_key]):
+        return jsonify({"success": False, "message": "Missing required fields"}), 400
+    if not isinstance(user_id, int) or len(username) > 50 or len(username.strip()) == 0:
+        return jsonify({"success": False, "message": "Invalid user_id or username"}), 400
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
+                cur.execute('SELECT "username" FROM "users" WHERE "id" = %s', (user_id,))
+                user = cur.fetchone()
+                if not user:
+                    return jsonify({"success": False, "message": "Invalid user ID"}), 404
+                if user['username'] is not None:
+                    return jsonify({"success": False, "message": "User already registered"}), 400
+                cur.execute('SELECT 1 FROM "users" WHERE "username" = %s AND "id" != %s', (username, user_id))
+                if cur.fetchone():
+                    return jsonify({"success": False, "message": "Username already taken"}), 400
                 cur.execute(
                     'UPDATE "users" SET "username" = %s, "public_key" = %s WHERE "id" = %s',
                     (username, public_key, user_id)
                 )
+                if cur.rowcount == 0:
+                    raise Exception("Failed to update user - no rows affected")
                 token = jwt.encode(
                     {"id": user_id, "exp": datetime.datetime.utcnow() + datetime.timedelta(days=30)},
-                    'your-secret-key-here',
+                    app.config['SECRET_KEY'],
                     algorithm="HS256"
                 )
                 cur.execute(
-                    'INSERT INTO "user_tokens" ("user_id", "token") VALUES (%s, %s) ON CONFLICT ("user_id") DO UPDATE SET "token" = %s',
-                    (user_id, token, token)
+                    'INSERT INTO "user_tokens" ("user_id", "token") VALUES (%s, %s) '
+                    'ON CONFLICT ("user_id") DO UPDATE SET "token" = EXCLUDED."token"',
+                    (user_id, token)
                 )
                 conn.commit()
-                print(f"User registered: {username} Token: {token}")
         return jsonify({"success": True, "token": token}), 201
+    except psycopg2.Error as e:
+        print(e)
+        conn.rollback()
+        print(f"Database error: {e.pgcode} - {e.pgerror}")
+        return jsonify({"success": False, "message": "Database error", "error": e.pgerror}), 500
     except Exception as e:
-        print(f"Registration error: {e}")
+        print(e)
+        conn.rollback()
+        print(f"Registration error: {type(e).__name__} - {str(e)}")
         return jsonify({"success": False, "message": "Registration failed", "error": str(e)}), 500
 
-
 @app.route('/api/verify-token', methods=['POST'])
+@authenticate_token
 def verify_token():
-    token = request.json.get('token')
-    print(f"Verifying token: {token}")
     try:
-        decoded = jwt.decode(token, 'your-secret-key-here', algorithms=["HS256"])
-        print(f"Decoded token: {decoded}")
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute('SELECT "token" FROM "user_tokens" WHERE "user_id" = %s', (decoded['id'],))
-                result = cur.fetchone()
-                print(f"DB token result: {result}")
-                if result and result['token'] == token:
-                    return jsonify({"success": True, "user": {"id": decoded['id']}}), 200
-                else:
-                    return jsonify({"success": False, "message": "Invalid or expired token"}), 401
+        return jsonify({"success": True, "user_id": request.user_id}), 200
     except Exception as e:
         print(f"Token verification error: {e}")
-        return jsonify({"success": False, "message": "Token verification failed", "error": str(e)}), 401
+        return jsonify({"success": False, "message": "Token verification failed", "error": str(e)}), 500
 
 @app.route('/api/search-friend', methods=['POST'])
 @authenticate_token
@@ -163,20 +190,56 @@ def search_friend():
         with get_db_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    'SELECT "username", "public_key" FROM "users" WHERE "phone_number" = %s',
+                    'SELECT "username", "public_key", "hide_online_status" FROM "users" WHERE "phone_number" = %s',
                     (phone_number,)
                 )
                 result = cur.fetchone()
                 if result:
                     username = result['username']
                     public_key = result['public_key']
-                    online_status = username in online_users
+                    hide_online_status = result['hide_online_status'] or False
+                    online_status = username in online_users and not hide_online_status
                     return jsonify({"username": username, "public_key": public_key, "online_status": online_status}), 200
                 else:
                     return jsonify({"success": False, "message": "User not found"}), 404
     except Exception as e:
         print(f"Search friend error: {e}")
         return jsonify({"success": False, "message": "Search failed", "error": str(e)}), 500
+
+@app.route('/api/send-friend-request', methods=['POST'])
+@authenticate_token
+def send_friend_request():
+    username = request.json.get('username')
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute('SELECT "id" FROM "users" WHERE "username" = %s', (username,))
+                to_user = cur.fetchone()
+                if not to_user:
+                    return jsonify({"success": False, "message": "User not found"}), 404
+                to_user_id = to_user['id']
+                cur.execute(
+                    'SELECT 1 FROM "friend_requests" '
+                    'WHERE ("from_user_id" = %s AND "to_user_id" = %s) '
+                    'AND "status" IN (%s, %s)',
+                    (request.user_id, to_user_id, 'pending', 'accepted')
+                )
+                if cur.fetchone():
+                    return jsonify({"success": False, "message": "Friend request already sent or user is already a friend"}), 400
+                cur.execute(
+                    'INSERT INTO "friend_requests" ("from_user_id", "to_user_id", "status") '
+                    'VALUES (%s, %s, %s)',
+                    (request.user_id, to_user_id, 'pending')
+                )
+                conn.commit()
+                if username in online_users:
+                    emit('friend_request_received', 
+                         {"from_username": online_users[request.user_id].username}, 
+                         room=online_users[username].sid)
+        return jsonify({"success": True, "message": "Friend request sent"}), 200
+    except Exception as e:
+        print(f"Send friend request error: {e}")
+        return jsonify({"success": False, "message": "Failed to send friend request", "error": str(e)}), 500
 
 @app.route('/api/friend-requests', methods=['GET'])
 @authenticate_token
@@ -185,8 +248,9 @@ def get_friend_requests():
         with get_db_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    'SELECT fr."id" AS request_id, u."id" AS from_user_id, u."username" AS from_username, u."public_key" '
-                    'FROM "friend_requests" fr JOIN "users" u ON fr."from_user_id" = u."id" '
+                    'SELECT fr."id" AS "request_id", u."username" AS "from_username", u."public_key" '
+                    'FROM "friend_requests" fr '
+                    'JOIN "users" u ON fr."from_user_id" = u."id" '
                     'WHERE fr."to_user_id" = %s AND fr."status" = %s',
                     (request.user_id, 'pending')
                 )
@@ -196,224 +260,215 @@ def get_friend_requests():
         print(f"Get friend requests error: {e}")
         return jsonify({"success": False, "message": "Failed to fetch friend requests", "error": str(e)}), 500
 
-@app.route('/api/handle-friend-request', methods=['POST'])
+@app.route('/api/friends', methods=['GET'])
 @authenticate_token
-def handle_friend_request():
-    request_id = request.json.get('request_id')
-    action = request.json.get('action')
-    if not request_id or action not in ['accept', 'block', 'delete']:
-        return jsonify({"success": False, "message": "Invalid request or action"}), 400
+def get_friends():
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    'SELECT "from_user_id", "to_user_id" FROM "friend_requests" WHERE "id" = %s AND "to_user_id" = %s AND "status" = %s',
-                    (request_id, request.user_id, 'pending')
+                    'SELECT u."username", u."public_key", u."hide_online_status" '
+                    'FROM "users" u JOIN "friend_requests" fr '
+                    'ON (fr."from_user_id" = u."id" AND fr."to_user_id" = %s) '
+                    'OR (fr."to_user_id" = u."id" AND fr."from_user_id" = %s) '
+                    'WHERE fr."status" = %s',
+                    (request.user_id, request.user_id, 'accepted')
                 )
-                request_data = cur.fetchone()
-                if not request_data:
-                    return jsonify({"success": False, "message": "Request not found or already handled"}), 404
-                
-                from_user_id = request_data['from_user_id']
-                if action == 'accept':
-                    cur.execute('UPDATE "friend_requests" SET "status" = %s WHERE "id" = %s', ('accepted', request_id))
-                elif action == 'block':
-                    cur.execute('DELETE FROM "friend_requests" WHERE "id" = %s', (request_id,))
-                    cur.execute(
-                        'INSERT INTO "blocked_users" ("user_id", "blocked_user_id") VALUES (%s, %s) ON CONFLICT DO NOTHING',
-                        (request.user_id, from_user_id)
-                    )
-                elif action == 'delete':
-                    cur.execute('UPDATE "friend_requests" SET "status" = %s WHERE "id" = %s', ('rejected', request_id))
-                conn.commit()
-
-                if action == 'accept':
-                    cur.execute('SELECT "username", "public_key" FROM "users" WHERE "id" = %s', (from_user_id,))
-                    from_user = cur.fetchone()
-                    cur.execute('SELECT "username", "public_key" FROM "users" WHERE "id" = %s', (request.user_id,))
-                    to_user = cur.fetchone()
-                    from_username = from_user['username']
-                    from_public_key = from_user['public_key']
-                    to_username = to_user['username']
-                    to_public_key = to_user['public_key']
-                    
-                    if from_username in online_users:
-                        emit('friend_request_accepted', 
-                             {"friend_username": to_username, "friend_public_key": to_public_key}, 
-                             room=online_users[from_username].sid)
-                    if to_username in online_users:
-                        emit('friend_added', 
-                             {"friend_username": from_username, "friend_public_key": from_public_key}, 
-                             room=online_users[to_username].sid)
-                
-                return jsonify({"success": True, "message": f"Friend request {action}ed"}), 200
+                friends = [
+                    {
+                        "username": row['username'], 
+                        "public_key": row['public_key'],
+                        "online_status": row['username'] in online_users and not (row['hide_online_status'] or False)
+                    } 
+                    for row in cur.fetchall()
+                ]
+        return jsonify({"success": True, "friends": friends}), 200
     except Exception as e:
-        print(f"Handle friend request error: {e}")
-        return jsonify({"success": False, "message": "Failed to handle friend request", "error": str(e)}), 500
+        print(f"Get friends error: {e}")
+        return jsonify({"success": False, "message": "Failed to fetch friends", "error": str(e)}), 500
 
-@app.route('/api/block-user', methods=['POST'])
+@app.route('/api/update-privacy', methods=['POST'])
 @authenticate_token
-def block_user():
+def update_privacy():
+    hide_online_status = request.json.get('hide_online_status', False)
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    'UPDATE "users" SET "hide_online_status" = %s WHERE "id" = %s',
+                    (hide_online_status, request.user_id)
+                )
+                conn.commit()
+                username = online_users.get(request.user_id, {}).username if request.user_id in online_users else None
+                if username:
+                    emit('status_update', {'username': username, 'online': not hide_online_status}, broadcast=True)
+        return jsonify({"success": True, "message": "Privacy updated"}), 200
+    except Exception as e:
+        print(f"Update privacy error: {e}")
+        return jsonify({"success": False, "message": "Failed to update privacy", "error": str(e)}), 500
+
+@app.route('/api/delete-message', methods=['POST'])
+@authenticate_token
+def delete_message():
+    timestamp = request.json.get('timestamp')
+    try:
+        emit('message_deleted', {'timestamp': timestamp}, broadcast=True)
+        return jsonify({"success": True, "message": "Message deletion broadcasted"}), 200
+    except Exception as e:
+        print(f"Delete message error: {e}")
+        return jsonify({"success": False, "message": "Failed to delete message", "error": str(e)}), 500
+
+@app.route('/api/delete-account', methods=['POST'])
+@authenticate_token
+def delete_account():
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute('DELETE FROM "friend_requests" WHERE "from_user_id" = %s OR "to_user_id" = %s', (request.user_id, request.user_id))
+                cur.execute('DELETE FROM "user_tokens" WHERE "user_id" = %s', (request.user_id,))
+                cur.execute('DELETE FROM "users" WHERE "id" = %s', (request.user_id,))
+                conn.commit()
+                if request.user_id in online_users:
+                    username = online_users[request.user_id].username
+                    del online_users[request.user_id]
+                    emit('status_update', {'username': username, 'online': False}, broadcast=True)
+        return jsonify({"success": True, "message": "Account deleted"}), 200
+    except Exception as e:
+        print(f"Delete account error: {e}")
+        return jsonify({"success": False, "message": "Failed to delete account", "error": str(e)}), 500
+
+@app.route('/api/logout', methods=['POST'])
+@authenticate_token
+def logout():
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute('DELETE FROM "user_tokens" WHERE "user_id" = %s', (request.user_id,))
+                conn.commit()
+        return jsonify({"success": True, "message": "Logged out"}), 200
+    except Exception as e:
+        print(f"Logout error: {e}")
+        return jsonify({"success": False, "message": "Failed to logout", "error": str(e)}), 500
+
+# SocketIO Handlers
+@socketio.on('connect')
+def handle_connect():
+    print('Client connected')
+
+@socketio.on('authenticate')
+def handle_authenticate(data):
+    token = data.get('token')
+    try:
+        decoded = jwt.decode(token, app.config['SECRET_KEY'], algorithms=["HS256"])
+        user_id = decoded['id']
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute('SELECT "username", "hide_online_status" FROM "users" WHERE "id" = %s', (user_id,))
+                user = cur.fetchone()
+                if user:
+                    online_users[user['username']] = type('User', (), {'sid': request.sid, 'username': user['username']})
+                    if not user['hide_online_status']:
+                        emit('status_update', {'username': user['username'], 'online': True}, broadcast=True)
+                    print(f"User authenticated: {user['username']}")
+    except jwt.InvalidTokenError as e:
+        print(f"Authentication error: {e}")
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    for username, user in list(online_users.items()):
+        if user.sid == request.sid:
+            del online_users[username]
+            with get_db_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute('SELECT "hide_online_status" FROM "users" WHERE "username" = %s', (username,))
+                    result = cur.fetchone()
+                    if result and not result['hide_online_status']:
+                        emit('status_update', {'username': username, 'online': False}, broadcast=True)
+            print(f"User disconnected: {username}")
+            break
+
+@socketio.on('message')
+def handle_message(data):
+    to_username = data.get('to_username')
+    if to_username in online_users:
+        from_username = next((u for u, v in online_users.items() if v.sid == request.sid), None)
+        if from_username and to_username:
+            with get_db_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        'SELECT 1 FROM "friend_requests" '
+                        'WHERE ((("from_user_id" = (SELECT "id" FROM "users" WHERE "username" = %s)) '
+                        'AND ("to_user_id" = (SELECT "id" FROM "users" WHERE "username" = %s))) '
+                        'OR (("from_user_id" = (SELECT "id" FROM "users" WHERE "username" = %s)) '
+                        'AND ("to_user_id" = (SELECT "id" FROM "users" WHERE "username" = %s)))) '
+                        'AND "status" = %s',
+                        (from_username, to_username, to_username, from_username, 'accepted')
+                    )
+                    if cur.fetchone():
+                        data['from_username'] = from_username
+                        emit('message', data, room=online_users[to_username].sid)
+                    else:
+                        print(f"Not friends: {from_username} -> {to_username}")
+
+@app.route('/api/accept-friend-request', methods=['POST'])
+@authenticate_token
+def accept_friend_request():
     username = request.json.get('username')
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute('SELECT "id" FROM "users" WHERE "username" = %s', (username,))
-                user = cur.fetchone()
-                if not user:
+                from_user = cur.fetchone()
+                if not from_user:
                     return jsonify({"success": False, "message": "User not found"}), 404
-                blocked_user_id = user['id']
-                cur.execute(
-                    'INSERT INTO "blocked_users" ("user_id", "blocked_user_id") VALUES (%s, %s) ON CONFLICT DO NOTHING',
-                    (request.user_id, blocked_user_id)
-                )
+                from_user_id = from_user['id']
                 cur.execute(
                     'UPDATE "friend_requests" SET "status" = %s '
-                    'WHERE ("from_user_id" = %s AND "to_user_id" = %s) OR ("from_user_id" = %s AND "to_user_id" = %s)',
-                    ('rejected', request.user_id, blocked_user_id, blocked_user_id, request.user_id)
+                    'WHERE "from_user_id" = %s AND "to_user_id" = %s AND "status" = %s',
+                    ('accepted', from_user_id, request.user_id, 'pending')
                 )
                 conn.commit()
-        return jsonify({"success": True, "message": "User blocked"}), 200
+        return jsonify({"success": True, "message": "Friend request accepted"}), 200
     except Exception as e:
-        print(f"Block user error: {e}")
-        return jsonify({"success": False, "message": "Failed to block user", "error": str(e)}), 500
+        print(f"Accept friend request error: {e}")
+        return jsonify({"success": False, "message": "Failed to accept request", "error": str(e)}), 500
 
-@app.route('/api/blocked-users', methods=['GET'])
+@app.route('/api/reject-friend-request', methods=['POST'])
 @authenticate_token
-def get_blocked_users():
+def reject_friend_request():
+    username = request.json.get('username')
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
+                cur.execute('SELECT "id" FROM "users" WHERE "username" = %s', (username,))
+                from_user = cur.fetchone()
+                if not from_user:
+                    return jsonify({"success": False, "message": "User not found"}), 404
+                from_user_id = from_user['id']
                 cur.execute(
-                    'SELECT u."username" FROM "blocked_users" b JOIN "users" u ON b."blocked_user_id" = u."id" WHERE b."user_id" = %s',
-                    (request.user_id,)
+                    'DELETE FROM "friend_requests" '
+                    'WHERE "from_user_id" = %s AND "to_user_id" = %s AND "status" = %s',
+                    (from_user_id, request.user_id, 'pending')
                 )
-                blocked_users = [row['username'] for row in cur.fetchall()]
-        return jsonify({"success": True, "blocked_users": blocked_users}), 200
+                conn.commit()
+        return jsonify({"success": True, "message": "Friend request rejected"}), 200
     except Exception as e:
-        print(f"Get blocked users error: {e}")
-        return jsonify({"success": False, "message": "Failed to fetch blocked users", "error": str(e)}), 500
+        print(f"Reject friend request error: {e}")
+        return jsonify({"success": False, "message": "Failed to reject request", "error": str(e)}), 500
 
-@socketio.on('connect')
-def handle_connect():
-    print(f"Client connected: {request.sid}")
-
-@socketio.on('authenticate')
-def handle_authenticate(token):
-    print(f"Received authenticate event with token: {token}")
+@app.route('/api/get-privacy', methods=['GET'])
+@authenticate_token
+def get_privacy():
     try:
-        decoded = jwt.decode(token, 'your-secret-key-here', algorithms=["HS256"])
-        print(f"Token decoded: {decoded}")
         with get_db_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    'SELECT u."username" FROM "users" u JOIN "user_tokens" ut ON u."id" = ut."user_id" WHERE ut."token" = %s',
-                    (token,)
-                )
+                cur.execute('SELECT "hide_online_status" FROM "users" WHERE "id" = %s', (request.user_id,))
                 result = cur.fetchone()
-                if result:
-                    username = result['username']
-                    socketio_sid = request.sid
-                    online_users[username] = type('Socket', (), {'sid': socketio_sid, 'username': username, 'user_id': decoded['id']})()
-                    cur.execute(
-                        'SELECT u."username" FROM "users" u JOIN "friend_requests" fr '
-                        'ON (fr."from_user_id" = u."id" AND fr."to_user_id" = %s) OR (fr."to_user_id" = u."id" AND fr."from_user_id" = %s) '
-                        'WHERE fr."status" = %s',
-                        (decoded['id'], decoded['id'], 'accepted')
-                    )
-                    friends = [row['username'] for row in cur.fetchall()]
-                    for friend in friends:
-                        if friend in online_users:
-                            emit('status_update', {"username": username, "online_status": True}, room=online_users[friend].sid)
-                    print(f"User authenticated: {username}")
-                else:
-                    print("No user found for token")
-                    emit('error', {"message": "Invalid token"})
-                    socketio.disconnect()
+                hide_online_status = result['hide_online_status'] if result else False
+        return jsonify({"success": True, "hide_online_status": hide_online_status}), 200
     except Exception as e:
-        print(f"Authentication failed: {e}")
-        emit('error', {"message": "Authentication failed", "error": str(e)})
-        socketio.disconnect()
-
-@socketio.on('message')
-def handle_message(data):
-    to_username = data.get('to_username')
-    encrypted_message = data.get('encrypted_message')
-    encrypted_aes_key = data.get('encrypted_aes_key')
-    signature = data.get('signature')
-    from_username = online_users.get(request.sid, type('Socket', (), {'username': None})()).username if request.sid in [u.sid for u in online_users.values()] else None
-    
-    if not all([from_username, to_username, encrypted_message, encrypted_aes_key, signature]):
-        emit('error', {"message": "Invalid message format"})
-        return
-    
-    try:
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    'SELECT 1 FROM "friend_requests" '
-                    'WHERE (("from_user_id" = %s AND "to_user_id" = (SELECT "id" FROM "users" WHERE "username" = %s)) '
-                    'OR ("to_user_id" = %s AND "from_user_id" = (SELECT "id" FROM "users" WHERE "username" = %s))) '
-                    'AND "status" = %s',
-                    (online_users[from_username].user_id, to_username, online_users[from_username].user_id, to_username, 'accepted')
-                )
-                friend_check = cur.fetchone()
-                if not friend_check:
-                    emit('error', {"message": "Recipient is not your friend"})
-                    return
-        
-        timestamp = datetime.datetime.utcnow().isoformat()
-        message = {
-            "from_username": from_username,
-            "to_username": to_username,
-            "encrypted_message": encrypted_message,
-            "encrypted_aes_key": encrypted_aes_key,
-            "signature": signature,
-            "timestamp": timestamp
-        }
-        
-        if to_username in online_users:
-            recipient_socket = online_users[to_username]
-            emit('message', message, room=recipient_socket.sid)
-            print(f"Message sent from {from_username} to {to_username}")
-        else:
-            emit('error', {"message": f"{to_username} is offline. Messages can only be sent to online friends."})
-            print(f"Message rejected: {to_username} is offline")
-    except Exception as e:
-        print(f"Message handling error: {e}")
-        emit('error', {"message": "Failed to send message", "error": str(e)})
-
-@socketio.on('message_delivered')
-def handle_message_delivered(data):
-    from_username = data.get('from_username')
-    timestamp = data.get('timestamp')
-    if from_username in online_users:
-        emit('message_status', 
-             {"to_username": online_users[request.sid].username, "status": "delivered", "timestamp": timestamp}, 
-             room=online_users[from_username].sid)
-
-@socketio.on('disconnect')
-def handle_disconnect():
-    for username, socket in list(online_users.items()):
-        if socket.sid == request.sid:
-            del online_users[username]
-            try:
-                with get_db_connection() as conn:
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            'SELECT u."username" FROM "users" u JOIN "friend_requests" fr '
-                            'ON (fr."from_user_id" = u."id" AND fr."to_user_id" = %s) OR (fr."to_user_id" = u."id" AND fr."from_user_id" = %s) '
-                            'WHERE fr."status" = %s',
-                            (socket.user_id, socket.user_id, 'accepted')
-                        )
-                        friends = [row['username'] for row in cur.fetchall()]
-                        for friend in friends:
-                            if friend in online_users:
-                                emit('status_update', {"username": username, "online_status": False}, room=online_users[friend].sid)
-                print(f"User disconnected: {username}")
-            except Exception as e:
-                print(f"Disconnect handling error: {e}")
-            break
+        print(f"Get privacy error: {e}")
+        return jsonify({"success": False, "message": "Failed to fetch privacy", "error": str(e)}), 500
 
 if __name__ == '__main__':
-    socketio.run(app, host='0.0.0.0', port=3000, debug=True)
+    app.run(host='0.0.0.0', port=3000, ssl_context=('cert.pem', 'key.pem'), debug=True)
